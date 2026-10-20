@@ -31,12 +31,14 @@ export type { BackendHandle, WorkspaceBackend } from "./backend.js";
 export { TestBackend, type TestBackendOptions } from "./backends/test.js";
 export {
   getWorkspace,
+  type LazyWorkspaceClient,
   type RuntimeExecOptions,
   type RuntimeGetOptions,
   type RuntimeKillOptions,
   type WorkspaceClient,
   type WorkspaceHandle,
   type WorkspaceRuntimeClient,
+  type WorkspaceSource,
 } from "./client.js";
 export { decodeExecEvents, encodeExecEvents } from "./exec-wire.js";
 export { R2Bucket, type R2BucketBinding, type R2BucketOptions } from "./mounts/providers/r2.js";
@@ -129,9 +131,4 @@ export {
   type WorkspaceStubHost,
   withWorkspace,
 } from "./with-workspace.js";
-export {
-  type ThinkWorkspaceCompatibility,
-  Workspace,
-  type WorkspaceGitFactory,
-  type WorkspaceOptions,
-} from "./workspace.js";
+export { Workspace, type WorkspaceGitFactory, type WorkspaceOptions } from "./workspace.js";
