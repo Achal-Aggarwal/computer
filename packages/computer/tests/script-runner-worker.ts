@@ -6,7 +6,11 @@ import {
   type WorkerJavaScriptBackendOptions,
 } from "../src/backends/worker-javascript/index.js";
 import { createGitClient } from "../src/git/index.js";
-import type { WorkspaceRuntimeValue, WorkspaceStub } from "../src/index.js";
+import type {
+  WorkspaceRuntimePendingCall,
+  WorkspaceRuntimeValue,
+  WorkspaceStub,
+} from "../src/index.js";
 import { unsafeToRepeat, Workspace } from "../src/index.js";
 import { createArtifactsModule } from "../src/modules/artifacts.js";
 import { createContainerModule } from "../src/modules/container.js";
@@ -61,6 +65,8 @@ function fakeContainerBackend(): WorkspaceBackend {
 // state outlives the object, so it counts host calls across the restart
 // and holds the gate a run waits on until the object restarts.
 const durableCalls = new Map<string, number>();
+// Each call onWait was told about.
+const waits: WorkspaceRuntimePendingCall[] = [];
 let gateOpen = false;
 // Named gates a run can wait on after the first, for a second restart.
 const opened = new Set<string>();
@@ -90,6 +96,7 @@ function javascriptBackend(
     ...overrides,
     maxStdioBytes: overrides.maxStdioBytes ?? 64,
     maxCapabilityBytes: 1024,
+    onWait: (call) => void waits.push(call),
     maxConcurrentCapabilityCalls: 2,
     modules: {
       "math-kit": "export const double = (value) => value * 2;",
@@ -148,6 +155,33 @@ function javascriptBackend(
         async wait(args) {
           await new Promise((resolve) => setTimeout(resolve, Number(args[0])));
           return countCall(String(args[1] ?? "wait"));
+        },
+        // Counts when it starts and again when it settles, and stops early
+        // if its call is aborted.
+        async slowTick(args, ctx) {
+          countCall(`start:${String(args[1])}`);
+          await new Promise((resolve, reject) => {
+            const timer = setTimeout(resolve, Number(args[0]));
+            ctx.signal.addEventListener("abort", () => {
+              clearTimeout(timer);
+              reject(ctx.signal.reason);
+            });
+          });
+          return countCall(String(args[1]));
+        },
+        // Waits for an answer, then returns it.
+        async approve(args, ctx) {
+          const action = String(args[0]);
+          countCall(`ask:${action}`);
+          const answer = await ctx.interrupt({ kind: "approval", action });
+          countCall(`answered:${action}`);
+          return answer;
+        },
+        // Like approve, but awaits first, as a real lookup would.
+        async approveLater(args, ctx) {
+          const action = String(args[0]);
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return ctx.interrupt({ kind: "approval", action });
         },
         async marker() {
           return {
@@ -279,6 +313,41 @@ export class HostDO extends DurableObject<Env> {
       await new Promise((resolve) => setTimeout(resolve, 10));
     }
     return handle.id;
+  }
+
+  async startWaiting(input: {
+    source: string;
+    id: string;
+    onInterrupt?: "fail" | "restart" | "replay";
+    timeoutMs?: number;
+  }) {
+    durableCalls.clear();
+    waits.length = 0;
+    const handle = await this.#workspace.runtime.exec(input.source, {
+      backend: "worker-javascript",
+      id: input.id,
+      onInterrupt: input.onInterrupt ?? "replay",
+      timeoutMs: input.timeoutMs,
+    });
+    void handle.result().catch(() => undefined);
+    return handle.id;
+  }
+
+  pending() {
+    return this.#workspace.runtime.pending();
+  }
+
+  waits() {
+    return waits;
+  }
+
+  async respond(id: string, callId: string, value: WorkspaceRuntimeValue) {
+    try {
+      await this.#workspace.runtime.respond(id, callId, value);
+      return { ok: true as const };
+    } catch (error) {
+      return { ok: false as const, code: (error as { code?: string }).code };
+    }
   }
 
   // Restart the object, as a deploy or crash would.
@@ -542,6 +611,36 @@ export default class extends WorkerEntrypoint<Env> {
       if (url.pathname === "/durable-recover") {
         await stub.recover();
         return new Response(null, { status: 204 });
+      }
+
+      if (url.pathname === "/interrupt-start") {
+        return Response.json({
+          id: await stub.startWaiting(
+            (await request.json()) as {
+              source: string;
+              id: string;
+              onInterrupt?: "fail" | "restart" | "replay";
+              timeoutMs?: number;
+            },
+          ),
+        });
+      }
+
+      if (url.pathname === "/interrupt-waits") {
+        return Response.json(await stub.waits());
+      }
+
+      if (url.pathname === "/interrupt-pending") {
+        return Response.json(await stub.pending());
+      }
+
+      if (url.pathname === "/interrupt-respond") {
+        const body = (await request.json()) as {
+          id: string;
+          callId: string;
+          value: WorkspaceRuntimeValue;
+        };
+        return Response.json(await stub.respond(body.id, body.callId, body.value));
       }
 
       if (url.pathname === "/durable-calls") {

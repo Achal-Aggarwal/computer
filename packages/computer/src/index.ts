@@ -110,6 +110,7 @@ export type {
   WorkspaceRuntimeKillOptions,
   WorkspaceRuntimeLoader,
   WorkspaceRuntimeOutputOptions,
+  WorkspaceRuntimePendingCall,
   WorkspaceRuntimeResult,
   WorkspaceRuntimeStatus,
   WorkspaceRuntimeTruncation,

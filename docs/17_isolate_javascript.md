@@ -195,6 +195,40 @@ modules: {
 }
 ```
 
+### Waiting for an answer
+
+A host module function can pause a replayable run until someone answers, for example to approve an action. Like replay, this is experimental. The code being run just calls the function and gets its result, however long the answer takes:
+
+```ts
+modules: {
+  "ws:github": {
+    postComment: async ([issue, body], ctx) => {
+      const { approved } = await ctx.interrupt({ kind: "approval", issue, body });
+      if (!approved) throw new Error("The comment was rejected.");
+      return github.comment(issue, body, { idempotencyKey: ctx.callId });
+    },
+  },
+}
+```
+
+`ctx.interrupt(payload)` releases the run's isolate once the run's other calls in flight finish. The run stays running, and time spent waiting doesn't count toward its timeout. `workspace.runtime.pending()` lists the calls waiting, with their payloads, and `respond()` answers one:
+
+```ts
+for (const call of await workspace.runtime.pending()) {
+  await workspace.runtime.respond(call.id, call.callId, { approved: true });
+}
+```
+
+To hear about a wait when it starts, for example to message whoever answers, give the backend an `onWait` function. It gets the same fields, at most once per wait, so `pending()` stays the source of truth. A Worker that calls the object can reach `pending()` and `respond()` through `workspace.stub().runtime`.
+
+Once none of its calls are waiting, the run replays to the call and the function runs again with the same `callId`. This time `interrupt()` returns the answer straight away, and the function carries on. Anything it does before `interrupt()` runs twice, so keep that part safe to repeat. A waiting run survives a deploy like any interrupted run, and `killExec()` ends one.
+
+- A call can interrupt once. A second `interrupt()` in the same call throws.
+- Only a run with `onInterrupt: "replay"` can wait. Anywhere else, `interrupt()` throws, so a Workspace with modules that interrupt should make `"replay"` its backend's default.
+- A run is released once each call in flight has finished or is waiting too, and those waits are answered together. A call the run makes after the first interrupt is held until it resumes, so a call that interrupts straight away can leave the next one to wait for a later round.
+- `respond()` throws `ENOTWAITING` for a call that isn't waiting, such as one already answered, so answering twice changes nothing.
+- Every answer replays the run from the top.
+
 ### Limits
 
 - A run gets three attempts, counted again each time it journals a call, and has to finish within its original timeout, counted from when it first started.

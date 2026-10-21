@@ -28,6 +28,15 @@ export class WorkspaceRuntimeBridge extends RpcTarget {
   #fetchesRunning = 0;
   readonly #fetchQueue: Array<() => void> = [];
   readonly #abortControllers = new Set<AbortController>();
+  // Responses on their way to the isolate, by their call's controller.
+  readonly #responses = new Map<Promise<BridgeResponse>, AbortController>();
+  // Calls that interrupted, by their controller.
+  readonly #waiting = new Set<AbortController>();
+  readonly #onWait?: (call: { seq: number; payload: unknown; since: number }) => void;
+  // Set once a call interrupts: new calls are held, never started.
+  #holding = false;
+  // Wakes quiesce() when another call starts waiting.
+  #waited?: () => void;
   #cancelled = false;
   #callTimedOut = false;
   #calls = 0;
@@ -52,6 +61,8 @@ export class WorkspaceRuntimeBridge extends RpcTarget {
       fetch?: (request: Request) => Promise<Response>;
       // Prefix of every call's callId, such as the execution id.
       callIdPrefix?: string;
+      // Called when a call interrupts, to release the run.
+      onWait?: (call: { seq: number; payload: unknown; since: number }) => void;
     } = {},
   ) {
     super();
@@ -68,6 +79,7 @@ export class WorkspaceRuntimeBridge extends RpcTarget {
     this.#journal = integrations.journal;
     this.#fetch = integrations.fetch;
     this.#callIdPrefix = integrations.callIdPrefix ?? crypto.randomUUID();
+    this.#onWait = integrations.onWait;
   }
 
   // Drain the runner's framed output stream. The isolate passes the
@@ -112,6 +124,9 @@ export class WorkspaceRuntimeBridge extends RpcTarget {
         return Promise.resolve(boundedError(error, this.#maxPayloadBytes));
       }
     }
+    // The run is being released for an interrupt. A call it makes now
+    // runs live when it resumes.
+    if (this.#holding) return new Promise<never>(() => undefined);
     let requestBytes: number;
     try {
       requestBytes = measureValue(args, this.#maxPayloadBytes, "request");
@@ -181,12 +196,23 @@ export class WorkspaceRuntimeBridge extends RpcTarget {
     const abort = new AbortController();
     this.#abortControllers.add(abort);
     const deadline = Date.now() + this.#maxCallDurationMs;
+    // The journal holds one answer per call, so a call can wait only once.
+    let interrupted = false;
     const operation = respond(async () => {
       if (name.startsWith("host/")) {
         return this.#callHostModule(name, args, {
           signal: abort.signal,
           deadline,
           callId,
+          interrupt: (payload) => {
+            if (interrupted) {
+              return Promise.reject(
+                new Error("ctx.interrupt() can only be called once per host module call."),
+              );
+            }
+            interrupted = true;
+            return this.#interrupt(step, abort, payload);
+          },
           access: this.#capability.access,
           resolvePath: (path, options) =>
             this.#capability.resolveConfined(path, options?.allowMissing ?? false),
@@ -258,6 +284,8 @@ export class WorkspaceRuntimeBridge extends RpcTarget {
       }
     }, this.#maxPayloadBytes);
     const call = withDeadline(operation, this.#maxCallDurationMs, this.#maxPayloadBytes, () => {
+      // A call waiting for an answer isn't late: the run is released.
+      if (this.#waiting.has(abort)) return;
       this.#callTimedOut = true;
       abort.abort(new Error("Workspace capability call timed out."));
     });
@@ -274,7 +302,7 @@ export class WorkspaceRuntimeBridge extends RpcTarget {
     // Errors count against the response budget too. The budget error
     // itself is short and not counted, and `maxCalls` bounds how many
     // the isolate can see.
-    return call
+    const delivered = call
       .then((response) => {
         if (isFetch) return "result" in response ? { result: response.result } : response;
         const bytes = "result" in response ? response.bytes : errorBytes(response);
@@ -293,6 +321,8 @@ export class WorkspaceRuntimeBridge extends RpcTarget {
         return "result" in response ? { result: response.result } : response;
       })
       .then((response) => {
+        // An interrupted call answers nothing: it runs again once answered.
+        if (this.#waiting.has(abort)) return new Promise<never>(() => undefined);
         // Write before deliver: the journal holds the response before the
         // isolate can act on it. A filesystem change is synchronous SQL on
         // the same database, with no I/O between it and here, so it and
@@ -300,6 +330,60 @@ export class WorkspaceRuntimeBridge extends RpcTarget {
         if (step?.kind !== "live" || this.#journal === undefined) return response;
         return { ...response, ...this.#journal.commit(step.seq, response) };
       });
+    this.#responses.set(delivered, abort);
+    void delivered.finally(() => this.#responses.delete(delivered)).catch(() => undefined);
+    return delivered;
+  }
+
+  #interrupt(
+    step: ReturnType<BridgeJournal["begin"]> | undefined,
+    abort: AbortController,
+    payload: unknown,
+  ): Promise<never> {
+    if (step?.kind !== "live" || this.#journal === undefined) {
+      return Promise.reject(
+        new Error(
+          'ctx.interrupt() needs a replayable run. Run the execution with onInterrupt: "replay", or make that the backend\'s default.',
+        ),
+      );
+    }
+    if (step.answer !== undefined) return Promise.resolve(step.answer.value as never);
+    if (this.#cancelled)
+      return Promise.reject(new Error("Workspace execution is being cancelled."));
+    if (!this.#waiting.has(abort)) {
+      let since: number;
+      try {
+        since = this.#journal.interrupt(step.seq, payload);
+      } catch (error) {
+        return Promise.reject(error);
+      }
+      this.#waiting.add(abort);
+      this.#waited?.();
+      this.#onWait?.({ seq: step.seq, payload, since });
+    }
+    // Settles only when the run is released and the call aborted.
+    return new Promise<never>((_, reject) => {
+      abort.signal.addEventListener("abort", () => reject(abort.signal.reason), { once: true });
+    });
+  }
+
+  /**
+   * Hold new calls and wait until each one in flight has been answered
+   * and journaled, or is waiting itself. The run can then be released
+   * without any call running twice when it resumes.
+   */
+  async quiesce(): Promise<void> {
+    this.#holding = true;
+    while (true) {
+      const answering = [...this.#responses].filter(([, abort]) => !this.#waiting.has(abort));
+      if (answering.length === 0) return;
+      // Look again once one is answered or starts waiting.
+      await new Promise<void>((resolve) => {
+        this.#waited = resolve;
+        const wake = () => resolve();
+        void Promise.race(answering.map(([response]) => response)).then(wake, wake);
+      });
+    }
   }
 
   // The isolate is waiting for a journaled call its replay never made.
@@ -539,10 +623,17 @@ export interface BridgeJournal {
         readonly at: number;
         readonly ordinal: number;
       }
-    | { readonly kind: "live"; readonly seq: number; readonly rerun: boolean }
+    | {
+        readonly kind: "live";
+        readonly seq: number;
+        readonly rerun: boolean;
+        readonly answer?: { readonly value: unknown };
+      }
     | { readonly kind: "diverge"; readonly message: string };
   /** Record a live call's response, and return its time and ordinal. */
   commit(seq: number, response: BridgeResponse): { at: number; ordinal: number };
+  /** Mark a live call as waiting for an answer, and return when it started. */
+  interrupt(seq: number, payload: unknown): number;
   /** Save a chunk of the isolate's event log. Throws on a malformed one. */
   record(position: unknown, events: unknown): void;
   /** Called when a call doesn't match the journal. */

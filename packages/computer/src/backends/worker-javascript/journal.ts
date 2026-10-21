@@ -80,14 +80,29 @@ export interface ResumeState {
   /** Calls journaled when the attempt started. */
   readonly callsAtAttempt: number;
   readonly start: ResumeStart;
+  /** When the run's first unanswered interrupt was made, if one is waiting. */
+  readonly waitingSince: number | null;
+  /** Time the run has spent waiting for answers, which its timeout leaves out. */
+  readonly waitedMs: number;
+}
+
+/** A call waiting for an answer, as `pending()` lists it. */
+export interface WaitingCall {
+  readonly id: string;
+  readonly seq: number;
+  readonly payload: unknown;
+  readonly since: number;
 }
 
 interface JournalEntry {
   readonly seq: number;
   readonly key: string;
   readonly label: string;
-  readonly state: "executing" | "applied";
+  // An interrupted call is `waiting` until it's answered, then `answered`
+  // until the resumed run makes it again.
+  readonly state: "executing" | "applied" | "waiting" | "answered";
   readonly response: string | null;
+  readonly answer: string | null;
   readonly at: number | null;
   readonly ordinal: number | null;
 }
@@ -105,6 +120,8 @@ export type JournalStep =
       readonly seq: number;
       /** The call was in flight when the run was interrupted. */
       readonly rerun: boolean;
+      /** The answer to the call's interrupt, which it now returns. */
+      readonly answer?: { readonly value: unknown };
     }
   | { readonly kind: "diverge"; readonly message: string };
 
@@ -130,6 +147,8 @@ export function createResumeTables(db: Database): void {
       execution_id TEXT NOT NULL,
       on_interrupt TEXT NOT NULL,
       attempt INTEGER NOT NULL,
+      waiting_since INTEGER,
+      waited_ms INTEGER NOT NULL DEFAULT 0,
       calls_at_attempt INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (backend, execution_id)
     )
@@ -152,6 +171,9 @@ export function createResumeTables(db: Database): void {
       label TEXT NOT NULL,
       state TEXT NOT NULL,
       response TEXT,
+      interrupt_payload TEXT,
+      waiting_since INTEGER,
+      answer TEXT,
       journaled_at INTEGER,
       journal_order INTEGER,
       PRIMARY KEY (backend, execution_id, seq)
@@ -209,8 +231,14 @@ export function saveResume(
 }
 
 export function loadResume(db: Database, backend: string, id: string): ResumeState | undefined {
-  const row = db.one<{ on_interrupt: string; attempt: number; calls_at_attempt: number }>(
-    `SELECT on_interrupt, attempt, calls_at_attempt FROM workspace_runtime_resume
+  const row = db.one<{
+    on_interrupt: string;
+    attempt: number;
+    calls_at_attempt: number;
+    waiting_since: number | null;
+    waited_ms: number;
+  }>(
+    `SELECT on_interrupt, attempt, calls_at_attempt, waiting_since, waited_ms FROM workspace_runtime_resume
      WHERE backend = ? AND execution_id = ?`,
     backend,
     id,
@@ -230,6 +258,8 @@ export function loadResume(db: Database, backend: string, id: string): ResumeSta
       attempt: Number(row.attempt),
       callsAtAttempt: Number(row.calls_at_attempt),
       start,
+      waitingSince: row.waiting_since === null ? null : Number(row.waiting_since),
+      waitedMs: Number(row.waited_ms),
     };
   } catch {
     return undefined;
@@ -251,6 +281,67 @@ export function recordAttempt(
     backend,
     id,
   );
+}
+
+/**
+ * Answer a waiting call. Returns how many of the run's calls are still
+ * waiting, or `undefined` if this one wasn't. Once none are, the run's
+ * wait ends and its timeout counts again.
+ */
+export function answerCall(
+  db: Database,
+  backend: string,
+  id: string,
+  seq: number,
+  value: unknown,
+): number | undefined {
+  const answered = db.all(
+    `UPDATE workspace_runtime_journal SET state = 'answered', answer = ?
+     WHERE backend = ? AND execution_id = ? AND seq = ? AND state = 'waiting'
+     RETURNING seq`,
+    encodeLimited(value, "answer"),
+    backend,
+    id,
+    seq,
+  );
+  if (answered.length === 0) return undefined;
+  const waiting = Number(
+    db.one<{ count: number }>(
+      `SELECT COUNT(*) AS count FROM workspace_runtime_journal
+       WHERE backend = ? AND execution_id = ? AND state = 'waiting'`,
+      backend,
+      id,
+    )?.count ?? 0,
+  );
+  if (waiting === 0) {
+    db.run(
+      `UPDATE workspace_runtime_resume
+       SET waited_ms = waited_ms + MAX(0, ? - waiting_since), waiting_since = NULL
+       WHERE backend = ? AND execution_id = ? AND waiting_since IS NOT NULL`,
+      Date.now(),
+      backend,
+      id,
+    );
+  }
+  return waiting;
+}
+
+/** Every call of this backend's runs that's waiting for an answer. */
+export function waitingCalls(db: Database, backend: string): WaitingCall[] {
+  return db
+    .all<{ execution_id: string; seq: number; interrupt_payload: string; waiting_since: number }>(
+      `SELECT execution_id, seq, interrupt_payload, waiting_since
+       FROM workspace_runtime_journal
+       WHERE backend = ? AND state = 'waiting'
+       ORDER BY waiting_since, execution_id, seq`,
+      backend,
+    )
+    .map((row) => ({
+      id: row.execution_id,
+      seq: Number(row.seq),
+      payload: decodeValue(row.interrupt_payload),
+      since: Number(row.waiting_since),
+    }));
 }
 
 /** How many calls a run has journaled. */
@@ -325,10 +416,12 @@ export class ExecutionJournal implements BridgeJournal {
         label: string;
         state: string;
         response: string | null;
+        answer: string | null;
         journaled_at: number | null;
         journal_order: number | null;
       }>(
-        `SELECT seq, call_key, label, state, response, journaled_at, journal_order FROM workspace_runtime_journal
+        `SELECT seq, call_key, label, state, response, answer, journaled_at, journal_order
+         FROM workspace_runtime_journal
          WHERE backend = ? AND execution_id = ? ORDER BY seq`,
         backend,
         id,
@@ -337,9 +430,10 @@ export class ExecutionJournal implements BridgeJournal {
         seq: Number(row.seq),
         key: row.call_key,
         label: row.label,
-        state: row.state === "applied" && row.response !== null ? "applied" : "executing",
+        state: journalState(row.state, row.response),
         // An empty response marks one stored in chunks.
         response: row.response === "" ? this.#chunkedResponse(Number(row.seq)) : row.response,
+        answer: row.answer,
         at: row.journaled_at === null ? null : Number(row.journaled_at),
         ordinal: row.journal_order === null ? null : Number(row.journal_order),
       }));
@@ -441,9 +535,23 @@ export class ExecutionJournal implements BridgeJournal {
           ordinal: entry.ordinal ?? 0,
         };
       }
+      const answer =
+        entry.answer === null ? undefined : { value: decodeValue(entry.answer) as unknown };
+      // An answered call runs again by design, so it isn't a rerun until
+      // it's under way.
+      if (entry.state === "answered") {
+        this.#db.run(
+          `UPDATE workspace_runtime_journal SET state = 'executing'
+           WHERE backend = ? AND execution_id = ? AND seq = ?`,
+          this.#backend,
+          this.#id,
+          entry.seq,
+        );
+        return { kind: "live", seq: entry.seq, rerun: false, answer };
+      }
       // The call was in flight when the execution was interrupted, so its
       // response never reached the code. Run it again.
-      return { kind: "live", seq: entry.seq, rerun: true };
+      return { kind: "live", seq: entry.seq, rerun: true, answer };
     }
     if (this.#unanswered > 0) {
       return {
@@ -498,6 +606,34 @@ export class ExecutionJournal implements BridgeJournal {
       seq,
     );
     return { at, ordinal: this.#lastOrdinal };
+  }
+
+  /**
+   * Mark a live call as waiting for an answer, and return when it
+   * started waiting. Its response is never committed: the run is
+   * released, and the call runs again once answered. The run's own
+   * waiting_since is when its first unanswered call started waiting,
+   * which is what its timeout leaves out.
+   */
+  interrupt(seq: number, payload: unknown): number {
+    const now = Date.now();
+    this.#db.run(
+      `UPDATE workspace_runtime_journal SET state = 'waiting', interrupt_payload = ?, waiting_since = ?
+       WHERE backend = ? AND execution_id = ? AND seq = ?`,
+      encodeLimited(payload, "payload"),
+      now,
+      this.#backend,
+      this.#id,
+      seq,
+    );
+    this.#db.run(
+      `UPDATE workspace_runtime_resume SET waiting_since = COALESCE(waiting_since, ?)
+       WHERE backend = ? AND execution_id = ?`,
+      now,
+      this.#backend,
+      this.#id,
+    );
+    return now;
   }
 
   diverged(message: string): void {
@@ -577,6 +713,24 @@ function cyrb53(text: string, seed: number): string {
   h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
   h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
   return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(36).padStart(11, "0");
+}
+
+function journalState(state: string, response: string | null): JournalEntry["state"] {
+  if (state === "applied") return response === null ? "executing" : "applied";
+  return state === "waiting" || state === "answered" ? state : "executing";
+}
+
+// Interrupt payloads and answers are stored in one row each.
+const MAX_WAIT_CHARACTERS = CHUNK_CHARACTERS;
+
+function encodeLimited(value: unknown, what: string): string {
+  const text = encodeValue(value);
+  if (text.length > MAX_WAIT_CHARACTERS) {
+    throw new Error(
+      `An interrupt's ${what} must encode to at most ${MAX_WAIT_CHARACTERS} characters.`,
+    );
+  }
+  return text;
 }
 
 const BYTES_TAG = "\u0000bytes";
