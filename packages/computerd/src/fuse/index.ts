@@ -1,19 +1,33 @@
-export type { FUSEBackend, FuseMountMode, ResolveFuseBackendOptions } from "./backend";
-export { parseFuseMountMode, resolveFuseBackend } from "./backend";
-export type { FuseMount, FuseOps, FuseStat } from "./driver";
-export { makeFUSEOps, mountFuse } from "./driver";
-export type { MountIgnoreSet } from "./ignore";
-export { MountIgnorePathError, parseMountIgnore, resolveMountIgnore } from "./ignore";
-export type { MountIgnoreConfig, MountIgnoreEnv, MountIgnoreInfo } from "./ignore-config";
+export type { FUSEBackend, FuseMountMode, ResolveFuseBackendOptions } from "./backend.js";
+export { parseFuseMountMode, resolveFuseBackend } from "./backend.js";
+export type { FuseMount, FuseOps, FuseStat, RemovalGuardBinding } from "./driver.js";
+export { makeFUSEOps, mountFuse } from "./driver.js";
+export { nativeRootsRequested, passthroughRequested } from "./options.js";
+export type { MountIgnoreSet } from "./ignore.js";
+export { MountIgnorePathError, parseMountIgnore, resolveMountIgnore } from "./ignore.js";
+export type {
+  MountIgnoreConfig,
+  MountIgnoreEnv,
+  MountIgnoreInfo,
+  NativeRootsInfo,
+  NativeRootsStatus,
+  PassthroughStatus,
+} from "./ignore-config.js";
 export {
   defaultIgnoreRoot,
   describeMountIgnore,
-  PASSTHROUGH_UNAVAILABLE_REASON,
   resolveMountIgnoreConfig,
-} from "./ignore-config";
-export type { LocalPassthrough, LocalPassthroughOptions, PassthroughStats } from "./passthrough";
-export { withLocalPassthrough } from "./passthrough";
-export type { ResolvedStore, StoreMode } from "./store";
-export { parseStoreMode, resolveStore } from "./store";
-export type { CreateNodeVFSOptions, NodeVFSHandle, NodeVirtualFileSystem } from "./vfs";
-export { createNodeVirtualFileSystem } from "./vfs";
+} from "./ignore-config.js";
+export type {
+  NativeRoots,
+  NativeRootsOptions,
+  NativeRootsStats,
+  RemovalGuard,
+} from "./native-roots.js";
+export { createNativeRoots } from "./native-roots.js";
+export type { LocalPassthrough, LocalPassthroughOptions, PassthroughStats } from "./passthrough.js";
+export { withLocalPassthrough } from "./passthrough.js";
+export type { ResolvedStore, StoreMode } from "./store.js";
+export { parseStoreMode, resolveStore } from "./store.js";
+export type { CreateNodeVFSOptions, NodeVFSHandle, NodeVirtualFileSystem } from "./vfs.js";
+export { createNodeVirtualFileSystem } from "./vfs.js";

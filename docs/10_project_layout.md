@@ -146,10 +146,14 @@ packages/computerd/
 │   ├── cli/
 │   │   └── computerd.ts                   # CLI entry
 │   ├── fuse/
-│   │   ├── driver.ts
+│   │   ├── driver.ts                # VFS op table and mountFuse
+│   │   ├── binding-ops.ts           # adapts the op table to fuse-napi
+│   │   ├── passthrough.ts           # local-only paths (MOUNT_IGNORE)
+│   │   ├── ignore.ts                # MOUNT_IGNORE matcher
+│   │   ├── ignore-config.ts         # startup config and /__computerd/info
+│   │   ├── options.ts               # mount options and init config
 │   │   ├── backend.ts
 │   │   ├── vfs.ts
-│   │   ├── fuse-native.d.ts         # fuse-native typings
 │   │   └── index.ts
 │   └── exec/
 │       ├── runner.ts
@@ -157,14 +161,15 @@ packages/computerd/
 │       ├── types.ts
 │       ├── log.ts
 │       └── index.ts
+├── vendor/
+│   └── fuse-napi/                   # patched libfuse 3 binding; see PATCHES.md
 ├── scripts/
 │   ├── build-bin.mjs                # SEA driver
 │   └── sea/
 │       └── bundle.mjs               # esbuild → SEA bundle
 ├── artifacts/
 │   └── computerd/
-│       ├── computerd-linux-x64
-│       └── computerd-macos-x64
+│       └── computerd-linux-x64
 ├── tsdown.config.ts                 # → dist/cli/computerd.js
 ├── tsconfig.json
 └── package.json
@@ -173,7 +178,7 @@ packages/computerd/
 Build pipeline: tsdown bundles `src/cli/computerd.ts` into `dist/cli/computerd.js`;
 `scripts/build-bin.mjs` together with `scripts/sea/bundle.mjs`
 produces the Node SEA single-file binary at
-`artifacts/computerd/computerd-{linux,macos}-x64`.
+`artifacts/computerd/computerd-linux-x64`.
 
 ## Tools
 
@@ -245,7 +250,7 @@ so each example can declare its own dependencies and scripts.
 - **oxfmt.** Formats JS, TypeScript and JSON, configured in
   `.oxfmtrc.json` at the repo root. Markdown, YAML, HTML and CSS are
   left alone. No ESLint, no Prettier.
-- **tsdown.** Builds every package: the Workspace package's ESM entrypoints and declarations, `@cloudflare/dofs` and `@cloudflare/computer-rpc`, and the `computerd` CLI. Sources use extensionless relative imports under `moduleResolution: "bundler"`.
+- **tsdown.** Builds every package: the Workspace package's ESM entrypoints and declarations, `@cloudflare/dofs` and `@cloudflare/computer-rpc`, and the `computerd` CLI. Relative imports resolve under `moduleResolution: "bundler"`.
 - **esbuild.** Used by `packages/computerd/scripts/sea/bundle.mjs` to produce the single-file `computerd` SEA bundle.
 - **vitest.** Drives unit tests in every package. `computerd` additionally
   uses `node --experimental-strip-types --test` for some scripts
